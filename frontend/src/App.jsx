@@ -1,10 +1,17 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 
 export default function App() {
   const [number, setNumber] = useState('');
   const [tasks, setTasks] = useState([]);
   const [history, setHistory] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  const tasksRef = useRef(tasks);
+
+  useEffect(() => {
+    tasksRef.current = tasks;
+  }, [tasks]);
 
   const startTask = async () => {
     const n = Number(number);
@@ -12,22 +19,63 @@ export default function App() {
       return alert("Невірне число (0–170)");
     }
 
+    setLoading(true);
     try {
       const taskId = Date.now().toString();
-      await axios.post('/api/solve', { number: n, taskId });
+      let response;
 
-      setTasks(prev => [...prev, {
-        taskId,
-        number: n,
-        progress: 0,
-        steps: [],
-        status: 'started'
-      }]);
+      if (n <= 70) {
+        response = await axios.post('/api/solve', { number: n, taskId });
+
+        if (response.data.status === 'queued') {
+          setTasks(prev => [...prev, {
+            taskId,
+            number: n,
+            progress: 0,
+            steps: [],
+            status: 'queued',
+            queuePosition: response.data.position,
+            type: 'single',
+            server: 'Server 1 (в черзі)',
+            result: null,
+            message: response.data.message || ''
+          }]);
+        } else {
+          setTasks(prev => [...prev, {
+            taskId,
+            number: n,
+            progress: 0,
+            steps: [],
+            status: 'started',
+            type: 'single',
+            server: response.data.server || 'Server 1',
+            result: null
+          }]);
+        }
+
+      } else {
+        response = await axios.post('/api/solve-distributed', { number: n, taskId });
+
+        setTasks(prev => [...prev, {
+          taskId,
+          number: n,
+          progress: 0,
+          steps: [],
+          status: 'started',
+          type: 'distributed',
+          distributedParts: response.data.parts || 2,
+          message: response.data.message || '',
+          partProgress: [],
+          result: null,
+          server: response.data.server || ''
+        }]);
+      }
 
       setNumber('');
     } catch (err) {
-      console.error(err);
-      alert("Помилка запуску задачі");
+      alert("Помилка запуску задачі: " + (err.response?.data?.error || err.message));
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -42,129 +90,261 @@ export default function App() {
             : task
         )
       );
-
-      alert("Задача скасована");
     } catch (err) {
-      console.error(err);
       alert("Не вдалося скасувати задачу");
     }
   };
 
-  useEffect(() => {
-    const activeTasks = tasks.filter(t => t.status === 'started' && t.progress < 100);
-    if (activeTasks.length === 0) return;
+  const fetchTaskProgress = async (task) => {
+    try {
+      const res = await axios.get('/api/progress', {
+        params: { taskId: task.taskId }
+      });
 
-    const interval = setInterval(async () => {
-      try {
-        const updated = await Promise.all(
-          activeTasks.map(async task => {
-            try {
-              const res = await axios.get('/api/progress', {
-                params: { taskId: task.taskId }
-              });
-              return {
-                ...task,
-                progress: res.data.progress,
-                steps: res.data.steps || [],
-                status: res.data.progress === 100 ? 'completed' : 'started'
-              };
-            } catch {
-              return task;
-            }
-          })
-        );
+      if (task.status === 'queued') return task;
 
-        setTasks(prev =>
-          prev.map(t =>
-            updated.find(u => u.taskId === t.taskId) || t
-          )
-        );
-      } catch (err) {
-        console.error(err);
+      return { 
+        ...task,
+        progress: res.data.progress || 0,
+        steps: res.data.steps || [],
+        status: res.data.progress >= 100 ? 'completed' : 'started',
+        type: res.data.type || task.type,
+        result: res.data.result || task.result,
+        distributedParts: res.data.parts,
+        partProgress: res.data.partProgress || [],
+        server: res.data.server || task.server,
+        message: res.data.message || '',
+      };
+    } catch (err) {
+      if (err.response?.status === 404 && task.status !== 'queued') {
+        return { ...task, status: 'queued', message: 'Очікує на виконання...' };
       }
-    }, 500);
+      return task;
+    }
+  };
 
-    return () => clearInterval(interval);
-  }, [tasks]);
+  const checkQueueStatus = async () => {
+    try {
+      const currentTasks = tasksRef.current;
+      const queuedTasks = currentTasks.filter(t => t.status === 'queued');
+
+      if (queuedTasks.length === 0) return;
+
+      for (const task of queuedTasks) {
+        try {
+          const res = await axios.get('/api/progress', {
+            params: { taskId: task.taskId }
+          });
+
+          if (res.data.success) {
+            setTasks(prev =>
+              prev.map(t =>
+                t.taskId === task.taskId
+                  ? {
+                      ...t,
+                      status: 'started',
+                      progress: res.data.progress || 0,
+                      server: res.data.server || t.server,
+                      queuePosition: undefined
+                    }
+                  : t
+              )
+            );
+          }
+        } catch (err) {}
+      }
+    } catch (err) {}
+  };
+
+  useEffect(() => {
+    const progressInterval = setInterval(async () => {
+      const currentTasks = tasksRef.current;
+      const active = currentTasks.filter(t =>
+        t.status === 'started' && t.progress < 100
+      );
+
+      if (active.length === 0) return;
+
+      try {
+        const updated = await Promise.all(active.map(fetchTaskProgress));
+        setTasks(prev =>
+          prev.map(t => updated.find(u => u.taskId === t.taskId) || t)
+        );
+      } catch {}
+    }, 1000);
+
+    const queueInterval = setInterval(checkQueueStatus, 3000);
+
+    return () => {
+      clearInterval(progressInterval);
+      clearInterval(queueInterval);
+    };
+  }, []);
 
   const fetchHistory = async () => {
     try {
       const res = await axios.get('/api/history');
-      setHistory(res.data);
-    } catch (err) {
-      console.error(err);
+      setHistory(res.data.tasks || res.data || []);
+    } catch {
       alert("Не вдалося отримати історію задач");
     }
   };
 
+  const formatLargeNumber = (num) => {
+    if (!num || num === "1" || num === "обчислюється...") return '';
+    if (num.length <= 50) return num;
+    return `${num.substring(0, 30)}...${num.substring(num.length - 20)}`;
+  };
+
+  const renderProgress = (task) => {
+    if (task.status === 'queued') {
+      return (
+        <div>
+          В черзі (позиція: {task.queuePosition || '?'})
+          <br />
+          <small>{task.message || 'Очікує на вільний слот...'}</small>
+        </div>
+      );
+    }
+
+    if (task.type === 'distributed' && task.partProgress.length > 0) {
+      return (
+        <div>
+          <div>Загальний прогрес: {task.progress.toFixed(1)}%</div>
+          {task.partProgress.map((p, i) => (
+            <div key={i}>
+              Частина {i + 1}: {p.progress?.toFixed(1) || 0}%
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    return <div>Прогрес: {task.progress.toFixed(1)}%</div>;
+  };
+
+  const renderTaskStatus = (task) => {
+    const statusMap = {
+      'completed': 'Завершено',
+      'started': 'Виконується',
+      'queued': 'В черзі',
+      'cancelled': 'Скасовано'
+    };
+    return statusMap[task.status] || task.status;
+  };
+
   return (
     <div>
-      <h1>Факторіал</h1>
+      <h1>Обчислення факторіалів</h1>
 
-      <input
-        type="number"
-        value={number}
-        onChange={e => setNumber(e.target.value)}
-        placeholder="Введіть число (0–170)"
-      />
+      <div>
+        <ul>
+          <li>0–70: один сервер</li>
+          <li>71–170: розподіл на 2 сервери</li>
+        </ul>
+      </div>
 
-      <button onClick={startTask}>Додати нову задачу</button>
-      <button onClick={fetchHistory}>Історія задач</button>
+      <div>
+        <input
+          type="number"
+          value={number}
+          onChange={e => setNumber(e.target.value)}
+          placeholder="Введіть число (0–170)"
+          min="0"
+          max="170"
+        />
+
+        <button onClick={startTask} disabled={loading}>
+          {loading ? 'Запуск...' : 'Додати задачу'}
+        </button>
+
+        <button onClick={fetchHistory}>
+          Історія задач
+        </button>
+      </div>
 
       <h2>Активні задачі</h2>
 
       {tasks.length === 0 ? (
         <p>Немає активних задач</p>
       ) : (
-        tasks.map(task => (
-          <div key={task.taskId}>
-            <p>Задача #{task.taskId}</p>
-            <p>Число: {task.number}</p>
-            <p>Статус: {task.status}</p>
+        <div>
+          {tasks.map(task => (
+            <div key={task.taskId}>
+              <h3>
+                {task.number}! (ID: {task.taskId.slice(-8)})
+              </h3>
 
-            {task.status === 'started' && (
-              <button onClick={() => cancelTask(task.taskId)}>
-                Скасувати
-              </button>
-            )}
+              <div>
+                <strong>Статус:</strong> {renderTaskStatus(task)}
+              </div>
 
-            <p>Прогрес: {task.progress}%</p>
+              {task.server && (
+                <div>
+                  <strong>Сервер:</strong> {task.server}
+                </div>
+              )}
 
-            {task.steps.length > 0 && (
-              <table border="1">
-                <thead>
-                  <tr>
-                    <th>Сервер</th>
-                    <th>Крок</th>
-                    <th>Результат</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {task.steps.map((s, i) => (
-                    <tr key={i}>
-                      <td>{s.server}</td>
-                      <td>{s.step}</td>
-                      <td>{s.result}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
+              {task.message && (
+                <div>
+                  <em>{task.message}</em>
+                </div>
+              )}
 
-            <hr />
-          </div>
-        ))
+              {renderProgress(task)}
+
+              {task.result && task.result !== "1" && (
+                <div>
+                  <h4>Результат:</h4>
+                  <div>{formatLargeNumber(task.result)}</div>
+                </div>
+              )}
+
+              <div>
+                {(task.status === 'started' || task.status === 'queued') && (
+                  <button onClick={() => cancelTask(task.taskId)}>
+                    Скасувати
+                  </button>
+                )}
+              </div>
+
+              {task.steps.length > 0 && (
+                <details>
+                  <summary>Кроки ({task.steps.length})</summary>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Сервер</th>
+                        <th>Крок</th>
+                        <th>Результат</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {task.steps.reverse().map((step, i) => (
+                        <tr key={i}>
+                          <td>{step.server}</td>
+                          <td>{step.step}</td>
+                          <td>{formatLargeNumber(step.result)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </details>
+              )}
+            </div>
+          ))}
+        </div>
       )}
 
       {history.length > 0 && (
         <>
-          <h2>Історія задач</h2>
-          <table border="1">
+          <h2>Історія задач ({history.length})</h2>
+          <table>
             <thead>
               <tr>
-                <th>Task ID</th>
                 <th>Число</th>
                 <th>Результат</th>
+                <th>Тип</th>
                 <th>Сервер</th>
                 <th>Дата</th>
               </tr>
@@ -172,9 +352,17 @@ export default function App() {
             <tbody>
               {history.map(h => (
                 <tr key={h._id}>
-                  <td>{h._id}</td>
-                  <td>{h.number}</td>
-                  <td>{h.result}</td>
+                  <td><strong>{h.number}!</strong></td>
+                  <td>{formatLargeNumber(h.result)}</td>
+                  <td>
+                    {h.type === 'single'
+                      ? 'Один сервер'
+                      : h.type === 'distributed'
+                      ? 'Розподілено'
+                      : h.type === 'part'
+                      ? 'Частина'
+                      : h.type}
+                  </td>
                   <td>{h.server}</td>
                   <td>{new Date(h.createdAt).toLocaleString()}</td>
                 </tr>

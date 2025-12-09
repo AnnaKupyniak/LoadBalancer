@@ -1,44 +1,127 @@
+version: '3.8'
+
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: factorial-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - factorial-network
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
   mongo:
     image: mongo:6
-    container_name: mongo
-    ports:
-      - "27017:27017"
+    container_name: factorial-mongo
+    restart: unless-stopped
     volumes:
       - mongo-data:/data/db
+    command: ["mongod", "--bind_ip_all"]
+    networks:
+      - factorial-network
+    expose:
+      - "27017"
 
-  backend1:
+  server1:
     build: ./backend/server1
-    container_name: backend1
+    container_name: factorial-server1
+    restart: unless-stopped
+    networks:
+      - factorial-network
     ports:
       - "8001:8001"
-    env_file:
-      - ./backend/server1/.env
+    environment:
+      - NODE_ENV=production
+      - PORT=8001
+      - SERVER_ID=server1
+      - PEER_URL=http://server2:8002
+      - BASE_URL=http://server1:8001 
+      - MONGO_URI=mongodb://mongo:27017/factorial_db
+      - REDIS_URL=redis://redis:6379
+      - DISTRIBUTION_THRESHOLD=70
+      - MAX_CONCURRENT_TASKS=2
+      - GLOBAL_QUEUE_NAME=factorial:global:queue
+      - GLOBAL_QUEUE_NAME=factorial:global:queue
+      - AUTH_SERVICE_URL=http://auth:8000
+      - JWT_SECRET=${JWT_SECRET}
     depends_on:
-      - mongo
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_started
 
-  backend2:
+  server2:
     build: ./backend/server2
-    container_name: backend2
+    container_name: factorial-server2
+    restart: unless-stopped
+    networks:
+      - factorial-network
     ports:
       - "8002:8002"
+    environment:
+      - NODE_ENV=production
+      - PORT=8002
+      - SERVER_ID=server2
+      - PEER_URL=http://server1:8001
+      - BASE_URL=http://server2:8002
+      - MONGO_URI=mongodb://mongo:27017/factorial_db
+      - REDIS_URL=redis://redis:6379
+      - DISTRIBUTION_THRESHOLD=70
+      - MAX_CONCURRENT_TASKS=2
+      - JWT_SECRET=${JWT_SECRET}
+      - GLOBAL_QUEUE_NAME=factorial:global:queue
+      - AUTH_SERVICE_URL=http://auth:8000
+      - JWT_SECRET=${JWT_SECRET}
+    depends_on:
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_started
+  auth:
+    build: ./backend/auth-server
+    container_name: factorial-auth
+    restart: unless-stopped
+    ports:
+      - "8000:8000" 
+    networks:
+      - factorial-network
     env_file:
-      - ./backend/server2/.env
+      - .env 
+    environment:
+      - NODE_ENV=production
+      - PORT=8000
     depends_on:
       - mongo
 
   nginx:
-    image: nginx:latest
-    container_name: nginx
+    image: nginx:alpine
+    container_name: factorial-nginx
+    restart: unless-stopped
     ports:
       - "80:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./frontend/dist:/usr/share/nginx/html
     depends_on:
-      - backend1
-      - backend2
-
+      - server1
+      - server2
+    networks:
+      - factorial-network
 
 volumes:
   mongo-data:
+    driver: local
+  redis-data:
+    driver: local
+
+networks:
+  factorial-network:
+    driver: bridge

@@ -15,8 +15,7 @@ const authMiddleware = async (req, res, next) => {
     }
     
     const token = authHeader.split(' ')[1];
-    console.log(`[${process.env.SERVER_ID}] Token received (first 20 chars):`, token.substring(0, 20) + '...');
-    
+
     // Верифікуємо токен через auth сервер
     try {
       const authUrl = process.env.AUTH_SERVICE_URL || 'http://auth:8000';

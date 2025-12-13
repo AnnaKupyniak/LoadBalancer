@@ -11,7 +11,6 @@ const crypto = require('crypto');
 const authMiddleware = require('./middleware/auth'); 
 const uuidv4 = () => crypto.randomUUID();
 
-// --- НАЛАШТУВАННЯ ---
 const SERVER_ID = process.env.SERVER_ID || 'serverX';
 const SERVER_PORT = process.env.PORT || 8001;
 const PEER_URL = process.env.PEER_URL;
@@ -21,9 +20,7 @@ const DISTRIBUTION_THRESHOLD = 70;
 const MAX_CONCURRENT_TASKS = parseInt(process.env.MAX_CONCURRENT_TASKS) || 2;
 const GLOBAL_QUEUE_NAME = process.env.GLOBAL_QUEUE_NAME || 'factorial:global:queue';
 
-// Redis клієнт
 let redisClient;
-let redisSubscriber;
 
 async function initRedis() {
   redisClient = redis.createClient({ 
@@ -65,25 +62,11 @@ mongoose.connect(process.env.MONGO_URI, {
   });
 
 const app = express();
-app.use(bodyParser.json({ limit: '10mb' }));
-
-// Middleware для логування
-app.use((req, res, next) => {
-  console.log(`[${SERVER_ID}] 📨 ${req.method} ${req.url}`);
-  if (req.body && req.body.coordinatorUrl) {
-    console.log(`[${SERVER_ID}] 📍 coordinatorUrl у запиті: ${req.body.coordinatorUrl}`);
-  }
-  next();
-});
+app.use(express.json({ limit: '10mb' }));
 
 initRedis().catch(err => {
   console.error('Failed to initialize Redis:', err);
 });
-
-// ------------------------------------------------------------------- 
-// ДОПОМІЖНІ ФУНКЦІЇ
-// -------------------------------------------------------------------
-
 const processSaveQueue = async (taskId, task, saveQueue) => {
   if (saveQueueProcessing.get(taskId)) return;
   
@@ -92,7 +75,21 @@ const processSaveQueue = async (taskId, task, saveQueue) => {
   const updates = [...saveQueue];
   saveQueue.length = 0;
   
+  // Перевіряємо, чи задача вже скасована
+  const currentTask = await Task.findOne({ taskId }).catch(() => null);
+  if (currentTask && currentTask.status === 'cancelled') {
+    console.log(`[${SERVER_ID}] Задача ${taskId} вже скасована, ігнорую оновлення`);
+    saveQueueProcessing.set(taskId, false);
+    return;
+  }
+  
   for (const update of updates) {
+    // Перевіряємо, чи це не оновлення після скасування
+    if (task.status === 'cancelled' && update.type !== 'cancelled') {
+      console.log(`[${SERVER_ID}] Ігнорую ${update.type} для скасованої задачі ${taskId}`);
+      continue;
+    }
+    
     if (update.type === 'progress') {
       task.result = update.currentValue;
       task.progress = Math.min(100, update.progress);
@@ -105,6 +102,11 @@ const processSaveQueue = async (taskId, task, saveQueue) => {
       
       task.steps.push(stepData);
     } else if (update.type === 'done') {
+      // Перевіряємо, чи задача не скасована
+      if (task.status === 'cancelled') {
+        console.log(`[${SERVER_ID}] Ігнорую done для скасованої задачі ${taskId}`);
+        continue;
+      }
       task.result = update.result;
       task.progress = 100;
       task.status = 'completed';
@@ -113,10 +115,16 @@ const processSaveQueue = async (taskId, task, saveQueue) => {
       task.progress = 0;
       task.status = 'failed';
       task.steps.push(update.stepData);
+    } else if (update.type === 'cancelled') {
+      task.result = 'CANCELLED';
+      task.progress = 0;
+      task.status = 'cancelled';
+      task.steps.push(update.stepData);
     }
     
     try {
       await task.save();
+      console.log(`[${SERVER_ID}] Статус задачі ${taskId} оновлено: ${task.status}`);
     } catch (dbErr) {
       console.error(`DB save error for ${taskId}:`, dbErr);
     }
@@ -128,52 +136,60 @@ const processSaveQueue = async (taskId, task, saveQueue) => {
     processSaveQueue(taskId, task, saveQueue);
   }
 };
-
 async function startWorkerTask(workerParams, task) {
   const { taskId, serverName } = workerParams;
   const saveQueue = [];
-  
-  console.log(`[${SERVER_ID}] 🔥 ВХІД до startWorkerTask для ${taskId}`);
-  console.log(`[${SERVER_ID}] 📊 Параметри воркера:`, {
-    start: workerParams.start,
-    end: workerParams.end,
-    serverName: workerParams.serverName,
-    isPart: workerParams.isPart
-  });
-  
+  let wasCancelled = false; // Додаємо прапор скасування
+
   return new Promise((resolve, reject) => {
     try {
-      console.log(`[${SERVER_ID}] 🔧 Створюю Worker для ${taskId}`);
-      console.log(`[${SERVER_ID}] 📍 Шлях до worker.js: ${path.join(__dirname, 'worker.js')}`);
-      
-      // Перевіряємо, чи файл існує
       const fs = require('fs');
       const workerPath = path.join(__dirname, 'worker.js');
       if (!fs.existsSync(workerPath)) {
-        console.error(`[${SERVER_ID}] ❌ Файл worker.js не знайдено: ${workerPath}`);
+        console.error(`[${SERVER_ID}]  Файл worker.js не знайдено: ${workerPath}`);
         throw new Error(`Файл worker.js не знайдено: ${workerPath}`);
       }
       
       const worker = new Worker(workerPath, {
         workerData: workerParams
       });
-      
-      console.log(`[${SERVER_ID}] ✅ Worker створено успішно для ${taskId}`);
-      
+
       runningTasks[taskId] = worker;
-      console.log(`[${SERVER_ID}] 📝 Додано ${taskId} до runningTasks, зараз: ${Object.keys(runningTasks).length} задач`);
-      
-      // 1. Обробка повідомлень від воркера
+
       worker.on('message', (msg) => {
-        console.log(`[${SERVER_ID}] 📨 ОТРИМАНО ПОВІДОМЛЕННЯ від ${taskId}:`, {
-          type: msg.type,
-          progress: msg.progress,
-          stepInfo: msg.stepInfo ? msg.stepInfo.substring(0, 50) + '...' : 'немає',
-          timestamp: new Date().toISOString()
-        });
+        console.log(`[${SERVER_ID}] Отримано повідомлення від воркера ${taskId}: ${msg.type}`);
+        
+        if (msg.type === 'cancelled') {
+          console.log(`[${SERVER_ID}] Воркер ${taskId} повідомив про скасування`);
+          wasCancelled = true;
+          
+          saveQueue.push({
+            type: 'cancelled',
+            stepData: { 
+              server: 'System', 
+              step: 'Скасовано користувачем', 
+              result: 'Задачу скасовано' 
+            },
+            receivedAt: Date.now()
+          });
+          
+          processSaveQueue(taskId, task, saveQueue).finally(() => {
+            if (runningTasks[taskId]) {
+              delete runningTasks[taskId];
+              runningCount = Math.max(0, runningCount - 1);
+            }
+            console.log(`[${SERVER_ID}] Воркер ${taskId} плавно завершено`);
+            resolve();
+          });
+          return;
+        }
         
         if (msg.type === 'progress') {
-          console.log(`[${SERVER_ID}] 📊 ПРОГРЕС ${taskId}: ${msg.progress}% - "${msg.stepInfo}"`);
+          // Ігноруємо прогрес після скасування
+          if (wasCancelled) {
+            console.log(`[${SERVER_ID}] Ігнорую прогрес від скасованого воркера ${taskId}`);
+            return;
+          }
           
           const stepData = {
             server: serverName,
@@ -189,12 +205,22 @@ async function startWorkerTask(workerParams, task) {
             stepData,
             receivedAt: Date.now()
           });
-          
-          console.log(`[${SERVER_ID}] 💾 Додано до saveQueue для ${taskId}, розмір: ${saveQueue.length}`);
+
           processSaveQueue(taskId, task, saveQueue);
           
         } else if (msg.type === 'done') {
-          console.log(`[${SERVER_ID}] 🎉 ВОРКЕР ${taskId} ЗАВЕРШИВСЯ! Результат: ${msg.result ? msg.result.substring(0, 30) + '...' : 'немає'}`);
+          console.log(`[${SERVER_ID}] Воркер ${taskId} повідомив про завершення`);
+          
+          // Перевіряємо, чи задача не скасована
+          if (wasCancelled || task.status === 'cancelled') {
+            console.log(`[${SERVER_ID}] Задача ${taskId} скасована, ігнорую результат`);
+            if (runningTasks[taskId]) {
+              delete runningTasks[taskId];
+              runningCount = Math.max(0, runningCount - 1);
+            }
+            resolve();
+            return;
+          }
           
           saveQueue.push({ 
             type: 'done', 
@@ -203,23 +229,22 @@ async function startWorkerTask(workerParams, task) {
           });
           
           processSaveQueue(taskId, task, saveQueue).then(async () => {
-            // Обробка частини задачі
             if (task.type === 'part' && task.parentTaskId) {
               try {
                 const actualCoordinatorUrl = task.coordinatorUrl;
                 
                 if (!actualCoordinatorUrl) {
-                  console.error(`[${SERVER_ID}] ❌ Не знайдено coordinatorUrl для ${taskId}`);
+                  console.error(`[${SERVER_ID}] Не знайдено coordinatorUrl для ${taskId}`);
                   
                   let fallbackUrl;
-                  if (SERVER_ID === 'server2') {
+                  if (SERVER_ID === 'server1') {
                     fallbackUrl = PEER_URL;
                   } else {
                     fallbackUrl = BASE_URL;
                   }
-                  
-                  console.log(`[${SERVER_ID}] 📌 Використовую fallback: ${fallbackUrl}`);
-                  
+
+                  console.log(`[${SERVER_ID}] Використовую fallback: ${fallbackUrl}`);
+
                   try {
                     const response = await axios.post(`${fallbackUrl}/part-completed`, {
                       partTaskId: taskId,
@@ -229,12 +254,12 @@ async function startWorkerTask(workerParams, task) {
                       timeout: 5000
                     });
                     
-                    console.log(`[${SERVER_ID}] ✅ Успішно повідомлено координатора (fallback):`, response.data);
+                    console.log(`[${SERVER_ID}] Успішно повідомлено координатора (fallback):`, response.data);
                   } catch (fallbackErr) {
-                    console.error(`[${SERVER_ID}] ❌ Fallback також не спрацював:`, fallbackErr.message);
+                    console.error(`[${SERVER_ID}]  Fallback також не спрацював:`, fallbackErr.message);
                   }
                 } else {
-                  console.log(`[${SERVER_ID}] 📣 Повідомлення координатора: ${actualCoordinatorUrl}/part-completed`);
+                  console.log(`[${SERVER_ID}] Повідомлення координатора: ${actualCoordinatorUrl}/part-completed`);
                   
                   const response = await axios.post(`${actualCoordinatorUrl}/part-completed`, {
                     partTaskId: taskId,
@@ -244,37 +269,53 @@ async function startWorkerTask(workerParams, task) {
                     timeout: 5000
                   });
                   
-                  console.log(`[${SERVER_ID}] ✅ Успішно повідомлено координатора:`, response.data);
+                  console.log(`[${SERVER_ID}] Успішно повідомлено координатора:`, response.data);
                 }
               } catch (notifyErr) {
-                console.error(`[${SERVER_ID}] ❌ Помилка повідомлення координатора для ${taskId}:`, notifyErr.message);
+                console.error(`[${SERVER_ID}] Помилка повідомлення координатора для ${taskId}:`, notifyErr.message);
               }
             }
             
-            delete runningTasks[taskId];
-            runningCount = Math.max(0, runningCount - 1);
-            console.log(`[${SERVER_ID}] 🔚 Видалено ${taskId} з runningTasks, залишилось: ${Object.keys(runningTasks).length}`);
-            console.log(`[${SERVER_ID}] 📉 runningCount: ${runningCount} (було ${runningCount + 1})`);
-            
+            if (runningTasks[taskId]) {
+              delete runningTasks[taskId];
+              runningCount = Math.max(0, runningCount - 1);
+            }
             resolve();
           }).catch(err => {
-            console.error(`[${SERVER_ID}] ❌ Помилка збереження результату для ${taskId}:`, err);
-            delete runningTasks[taskId];
-            runningCount = Math.max(0, runningCount - 1);
+            console.error(`[${SERVER_ID}] Помилка збереження результату для ${taskId}:`, err);
+            if (runningTasks[taskId]) {
+              delete runningTasks[taskId];
+              runningCount = Math.max(0, runningCount - 1);
+            }
             reject(err);
           });
           
-        } else if (msg.type === 'hello') {
-          console.log(`[${SERVER_ID}] 👋 Воркер ${taskId} каже: ${msg.message}`);
         } else if (msg.type === 'error') {
-          console.error(`[${SERVER_ID}] ❌ Воркер ${taskId} повідомив про помилку:`, msg.error);
+          console.error(`[${SERVER_ID}]  Воркер ${taskId} повідомив про помилку:`, msg.error);
+          
+          saveQueue.push({
+            type: 'error',
+            stepData: { 
+              server: 'System', 
+              step: 'Worker Error', 
+              result: msg.error 
+            },
+            receivedAt: Date.now()
+          });
+          
+          processSaveQueue(taskId, task, saveQueue).finally(() => {
+            if (runningTasks[taskId]) {
+              delete runningTasks[taskId];
+              runningCount = Math.max(0, runningCount - 1);
+            }
+            reject(new Error(msg.error));
+          });
         }
       });
-      
-      // 2. Обробка помилок воркера
+
       worker.on('error', (err) => {
-        console.error(`[${SERVER_ID}] ❌ ПОМИЛКА ВОРКЕРА ${taskId}:`, err);
-        console.error(`[${SERVER_ID}] ❌ Стек помилки:`, err.stack);
+        console.error(`[${SERVER_ID}] ПОМИЛКА ВОРКЕРА ${taskId}:`, err);
+        console.error(`[${SERVER_ID}] Стек помилки:`, err.stack);
         
         saveQueue.push({
           type: 'error',
@@ -287,39 +328,54 @@ async function startWorkerTask(workerParams, task) {
         });
         
         processSaveQueue(taskId, task, saveQueue).finally(() => {
-          delete runningTasks[taskId];
-          runningCount = Math.max(0, runningCount - 1);
-          console.error(`[${SERVER_ID}] 🚨 Воркер ${taskId} завершився з помилкою`);
+          if (runningTasks[taskId]) {
+            delete runningTasks[taskId];
+            runningCount = Math.max(0, runningCount - 1);
+          }
+          console.error(`[${SERVER_ID}] Воркер ${taskId} завершився з помилкою`);
           reject(err);
         });
       });
       
-      // 3. Обробка виходу воркера
       worker.on('exit', (code) => {
-        console.log(`[${SERVER_ID}] 🔚 Воркер ${taskId} вийшов з кодом: ${code}`);
+        console.log(`[${SERVER_ID}] Воркер ${taskId} завершився з кодом ${code}, wasCancelled=${wasCancelled}`);
         
-        if (code !== 0 && code !== 1 && runningTasks[taskId]) {
-          console.error(`[${SERVER_ID}] ⚠️ Воркер ${taskId} зупинився неочікувано з кодом ${code}`);
+        // Якщо воркер завершився без повідомлення cancelled, але задача скасована
+        if (!wasCancelled && task.status === 'cancelled') {
+          console.log(`[${SERVER_ID}] Задача ${taskId} скасована, але воркер не повідомив про це`);
+          wasCancelled = true;
+        }
+        
+        if (runningTasks[taskId]) {
           delete runningTasks[taskId];
           runningCount = Math.max(0, runningCount - 1);
         }
+        
+        // Якщо воркер завершився, але ми не отримали ні done, ні cancelled
+        if (!wasCancelled && task.status !== 'completed' && task.status !== 'failed') {
+          console.log(`[${SERVER_ID}] Воркер ${taskId} завершився неочікувано, встановлюю статус failed`);
+          saveQueue.push({
+            type: 'error',
+            stepData: { 
+              server: 'System', 
+              step: 'Worker завершився неочікувано', 
+              result: `Код завершення: ${code}` 
+            },
+            receivedAt: Date.now()
+          });
+          processSaveQueue(taskId, task, saveQueue).finally(() => {
+            resolve();
+          });
+        }
       });
       
-      // 4. Відправляємо тестове повідомлення воркеру (опціонально)
-      setTimeout(() => {
-        if (worker.threadId) {
-          console.log(`[${SERVER_ID}] 🧪 Воркер ${taskId} має threadId: ${worker.threadId}`);
-        }
-      }, 100);
-      
     } catch (workerCreationError) {
-      console.error(`[${SERVER_ID}] ❌ КРИТИЧНА ПОМИЛКА СТВОРЕННЯ ВОРКЕРА для ${taskId}:`, workerCreationError);
-      console.error(`[${SERVER_ID}] ❌ Стек помилки:`, workerCreationError.stack);
+      console.error(`[${SERVER_ID}] КРИТИЧНА ПОМИЛКА СТВОРЕННЯ ВОРКЕРА для ${taskId}:`, workerCreationError);
+      console.error(`[${SERVER_ID}] Стек помилки:`, workerCreationError.stack);
       reject(workerCreationError);
     }
   });
 }
-
 async function runTask(taskData, userId, username) {
   const { taskId, number } = taskData;
   
@@ -360,24 +416,19 @@ async function runTask(taskData, userId, username) {
 
 async function runTaskPart(partTaskData) {
   const { taskId, start, end, initialValue, parentTaskId, coordinatorUrl } = partTaskData;
-  
-  console.log(`[${SERVER_ID}] 🚀 Запуск частини ${taskId}: ${start}-${end}`);
-  console.log(`[${SERVER_ID}] 📌 Отриманий coordinatorUrl: ${coordinatorUrl}`);
-  console.log(`[${SERVER_ID}] 📌 Мій SERVER_ID: ${SERVER_ID}`);
-  
   let actualCoordinatorUrl = coordinatorUrl;
   
   if (!actualCoordinatorUrl) {
-    console.warn(`[${SERVER_ID}] ⚠️ Не отримано coordinatorUrl, використовую fallback`);
-    if (SERVER_ID === 'server2') {
+    console.warn(`[${SERVER_ID}] Не отримано coordinatorUrl, використовую fallback`);
+    if (SERVER_ID === 'server1') {
       actualCoordinatorUrl = PEER_URL;
     } else {
       actualCoordinatorUrl = BASE_URL;
     }
   }
-  
-  console.log(`[${SERVER_ID}] 📌 Буде використано coordinatorUrl: ${actualCoordinatorUrl}`);
-  
+
+  console.log(`[${SERVER_ID}] Буде використано coordinatorUrl: ${actualCoordinatorUrl}`);
+
   let task = await Task.findOne({ taskId });
   if (!task) {
     task = new Task({
@@ -421,13 +472,8 @@ async function runTaskPart(partTaskData) {
   return startWorkerTask(workerParams, task);
 }
 
-// -------------------------------------------------------------------
-// РОЗПОДІЛ ЗАДАЧ ДЛЯ ВЕЛИКИХ ЧИСЕЛ
-// -------------------------------------------------------------------
-
 async function distributeLargeTask(number, mainTaskId, userId, username) {
-  console.log(`[${SERVER_ID}] 🔀 Розподіл задачі ${number}! (ID: ${mainTaskId}) для користувача ${username}`);
-  
+
   const task = new Task({
     taskId: mainTaskId,
     number: number,
@@ -447,9 +493,7 @@ async function distributeLargeTask(number, mainTaskId, userId, username) {
   const midpoint = Math.floor(number / 2);
   
   const myUrl = BASE_URL;
-  
-  console.log(`[${SERVER_ID}] Мій URL для координації: ${myUrl}`);
-  
+
   const parts = [
     { 
       start: 1, 
@@ -470,7 +514,7 @@ async function distributeLargeTask(number, mainTaskId, userId, username) {
   ];
   
   for (const part of parts) {
-    console.log(`[${SERVER_ID}] 🔄 Обробка частини ${part.partId}: ${part.start}-${part.end} на ${part.server}`);
+    console.log(`[${SERVER_ID}]  Обробка частини ${part.partId}: ${part.start}-${part.end} на ${part.server}`);
     
     task.distributedParts.push({
       partId: part.partId,
@@ -501,7 +545,7 @@ async function distributeLargeTask(number, mainTaskId, userId, username) {
       if (runningCount < MAX_CONCURRENT_TASKS) {
         runningCount++;
         
-        console.log(`[${SERVER_ID}] 🚀 Запуск частини ${part.partId} негайно`);
+        console.log(`[${SERVER_ID}] Запуск частини ${part.partId} негайно`);
         
         runTaskPart({
           taskId: part.partId,
@@ -520,12 +564,12 @@ async function distributeLargeTask(number, mainTaskId, userId, username) {
           await redisClient.lPush(GLOBAL_QUEUE_NAME, JSON.stringify(queueItem));
           const afterAdd = await redisClient.lLen(GLOBAL_QUEUE_NAME);
           
-          console.log(`[${SERVER_ID}] 📝 Частину ${part.partId} додано до черги (немає вільних слотів)`);
+          console.log(`[${SERVER_ID}] Частину ${part.partId} додано до черги (немає вільних слотів)`);
           console.log(`   Довжина черги: ${beforeAdd} -> ${afterAdd}`);
         }
       }
     } else if (PEER_URL) {
-      console.log(`[${SERVER_ID}] 🌐 Відправка частини ${part.partId} на peer: ${PEER_URL}`);
+      console.log(`[${SERVER_ID}] Відправка частини ${part.partId} на peer: ${PEER_URL}`);
       
       try {
         const response = await axios.post(`${PEER_URL}/solve-part`, {
@@ -539,20 +583,20 @@ async function distributeLargeTask(number, mainTaskId, userId, username) {
           timeout: 5000
         });
         
-        console.log(`[${SERVER_ID}] ✅ Частина ${part.partId} успішно відправлена на peer:`, response.data.server);
+        console.log(`[${SERVER_ID}]  Частина ${part.partId} успішно відправлена на peer:`, response.data.server);
         
         const partInfo = task.distributedParts.find(p => p.partId === part.partId);
         if (partInfo) {
           partInfo.server = response.data.server || 'peer';
         }
       } catch (err) {
-        console.error(`[${SERVER_ID}] ❌ Помилка відправки частини на peer:`, err.message);
-        console.log(`[${SERVER_ID}] 🔄 Fallback: обробка частини ${part.partId} локально`);
+        console.error(`[${SERVER_ID}]  Помилка відправки частини на peer:`, err.message);
+        console.log(`[${SERVER_ID}] Fallback: обробка частини ${part.partId} локально`);
         
         if (runningCount < MAX_CONCURRENT_TASKS) {
           runningCount++;
           
-          console.log(`[${SERVER_ID}] 🚀 Запуск частини ${part.partId} локально (fallback)`);
+          console.log(`[${SERVER_ID}]  Запуск частини ${part.partId} локально (fallback)`);
           
           runTaskPart({
             taskId: part.partId,
@@ -574,19 +618,15 @@ async function distributeLargeTask(number, mainTaskId, userId, username) {
             partInfo.server = `${SERVER_ID} (fallback queued)`;
           }
           
-          console.log(`[${SERVER_ID}] 📝 Частину ${part.partId} додано до локальної черги (fallback)`);
+          console.log(`[${SERVER_ID}]  Частину ${part.partId} додано до локальної черги (fallback)`);
         }
       }
     }
   }
   
   await task.save();
-  console.log(`[${SERVER_ID}] ✅ Розподіл задачі ${mainTaskId} завершено`);
+  console.log(`[${SERVER_ID}] Розподіл задачі ${mainTaskId} завершено`);
 }
-
-// -------------------------------------------------------------------
-// ENDPOINTS
-// -------------------------------------------------------------------
 
 app.get('/health', (req, res) => {
   res.json({
@@ -598,133 +638,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-app.get('/debug/redis', async (req, res) => {
-  try {
-    if (!redisClient) {
-      return res.json({ error: 'Redis client not initialized' });
-    }
-    
-    const queueLength = await redisClient.lLen(GLOBAL_QUEUE_NAME);
-    const allItems = await redisClient.lRange(GLOBAL_QUEUE_NAME, 0, -1);
-    
-    res.json({
-      redis: 'connected',
-      queueName: GLOBAL_QUEUE_NAME,
-      queueLength,
-      items: allItems.map(item => JSON.parse(item))
-    });
-  } catch (err) {
-    res.json({ error: err.message });
-  }
-});
-
-app.get('/debug/network', async (req, res) => {
-  const results = {
-    server: SERVER_ID,
-    baseUrl: BASE_URL,
-    peerUrl: PEER_URL,
-    ports: {
-      current: SERVER_PORT
-    }
-  };
-  
-  if (PEER_URL) {
-    try {
-      const peerResponse = await axios.get(`${PEER_URL}/health`, { timeout: 3000 });
-      results.peerConnection = {
-        status: 'success',
-        data: peerResponse.data
-      };
-    } catch (err) {
-      results.peerConnection = {
-        status: 'failed',
-        error: err.message,
-        code: err.code
-      };
-    }
-  }
-  
-  res.json(results);
-});
-
-app.get('/debug/status', (req, res) => {
-  res.json({
-    server: SERVER_ID,
-    max: MAX_CONCURRENT_TASKS,
-    running: runningCount,
-    available: MAX_CONCURRENT_TASKS - runningCount,
-    runningTasks: Object.keys(runningTasks),
-    health: 'healthy',
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.get('/debug/tasks', async (req, res) => {
-  try {
-    const tasks = await Task.find({}).sort({ createdAt: -1 }).limit(10);
-    const runningTaskIds = Object.keys(runningTasks);
-    
-    res.json({
-      totalTasks: tasks.length,
-      tasks: tasks.map(t => ({
-        taskId: t.taskId,
-        type: t.type,
-        status: t.status,
-        progress: t.progress,
-        parentTaskId: t.parentTaskId,
-        coordinatorUrl: t.coordinatorUrl,
-        userId: t.userId,
-        username: t.username
-      })),
-      runningTasks: runningTaskIds,
-      runningCount
-    });
-  } catch (err) {
-    res.json({ error: err.message });
-  }
-});
-
-// Тестовий endpoint для перевірки callback
-app.post('/test-callback', (req, res) => {
-  console.log(`[${SERVER_ID}] ✅ Отримано тестовий callback:`, req.body);
-  res.json({ 
-    success: true, 
-    server: SERVER_ID, 
-    received: req.body,
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.post('/test-coordinator', async (req, res) => {
-  const { coordinatorUrl } = req.body;
-  
-  console.log(`[${SERVER_ID}] 📍 Тест coordinatorUrl: ${coordinatorUrl}`);
-  console.log(`[${SERVER_ID}] 📍 Мій BASE_URL: ${BASE_URL}`);
-  console.log(`[${SERVER_ID}] 📍 Вони рівні?: ${coordinatorUrl === BASE_URL}`);
-  
-  try {
-    if (coordinatorUrl && coordinatorUrl !== BASE_URL) {
-      const response = await axios.post(`${coordinatorUrl}/test-callback`, {
-        test: true,
-        from: SERVER_ID,
-        timestamp: new Date().toISOString()
-      }, { timeout: 3000 });
-      
-      console.log(`[${SERVER_ID}] ✅ Успішно достукався до ${coordinatorUrl}:`, response.data);
-    }
-    
-    res.json({
-      success: true,
-      receivedCoordinatorUrl: coordinatorUrl,
-      myBaseUrl: BASE_URL,
-      areEqual: coordinatorUrl === BASE_URL
-    });
-  } catch (err) {
-    console.error(`[${SERVER_ID}] ❌ Помилка тесту:`, err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 app.post('/solve', authMiddleware, async (req, res) => {
   const { number } = req.body;
   const taskId = uuidv4();
@@ -733,12 +646,7 @@ app.post('/solve', authMiddleware, async (req, res) => {
     return res.status(400).json({ error: 'Число має бути від 0 до 170.' });
   }
   
-  console.log(`[${SERVER_ID}] 📥 Отримано задачу ${number}! від користувача ${req.username} (ID: ${req.userId})`);
-  console.log(`[${SERVER_ID}] Статус: runningCount=${runningCount}, MAX=${MAX_CONCURRENT_TASKS}`);
-  
   if (number > DISTRIBUTION_THRESHOLD) {
-    console.log(`[${SERVER_ID}] 🔀 Задача ${number}! перевищує поріг ${DISTRIBUTION_THRESHOLD} - розподіляємо`);
-    
     distributeLargeTask(number, taskId, req.userId, req.username).catch(err => {
       console.error(`Помилка розподілення задачі ${taskId}:`, err);
     });
@@ -754,9 +662,6 @@ app.post('/solve', authMiddleware, async (req, res) => {
   
   if (runningCount < MAX_CONCURRENT_TASKS) {
     runningCount++;
-    
-    console.log(`[${SERVER_ID}] 🚀 Запуск задачі ${taskId} негайно`);
-    
     runTask({ taskId, number }, req.userId, req.username).catch(err => {
       console.error(`Помилка виконання задачі ${taskId}:`, err);
       runningCount = Math.max(0, runningCount - 1);
@@ -785,9 +690,6 @@ app.post('/solve', authMiddleware, async (req, res) => {
         
         await redisClient.lPush(GLOBAL_QUEUE_NAME, JSON.stringify(queueItem));
         const queueLength = await redisClient.lLen(GLOBAL_QUEUE_NAME);
-        
-        console.log(`[${SERVER_ID}] 📝 Задачу ${taskId} додано до черги (позиція: ${queueLength})`);
-        
         return res.status(202).json({
           success: true,
           status: 'queued',
@@ -814,14 +716,11 @@ app.post('/solve', authMiddleware, async (req, res) => {
 
 app.post('/solve-part', async (req, res) => {
   const { taskId, start, end, initialValue = "1", parentTaskId, coordinatorUrl } = req.body;
-  
-  console.log(`[${SERVER_ID}] 📥 Отримано частину задачі ${taskId} (${start}-${end}) від ${coordinatorUrl}`);
-  console.log(`[${SERVER_ID}] Статус: runningCount=${runningCount}, MAX=${MAX_CONCURRENT_TASKS}`);
-  
+
   if (runningCount < MAX_CONCURRENT_TASKS) {
     runningCount++;
     
-    console.log(`[${SERVER_ID}] 🚀 Запуск частини ${taskId} негайно`);
+    console.log(`[${SERVER_ID}] Запуск частини ${taskId} негайно`);
     
     runTaskPart({
       taskId,
@@ -859,9 +758,7 @@ app.post('/solve-part', async (req, res) => {
         };
         
         await redisClient.lPush(GLOBAL_QUEUE_NAME, JSON.stringify(queueItem));
-        
-        console.log(`[${SERVER_ID}] 📝 Частину ${taskId} додано до черги`);
-        
+
         res.status(202).json({
           success: true,
           status: 'part_queued',
@@ -886,16 +783,12 @@ app.post('/solve-part', async (req, res) => {
 
 app.post('/part-completed', async (req, res) => {
   const { partTaskId, result, mainTaskId } = req.body;
-  
-  console.log(`[${SERVER_ID}] ✅ Частина завершена: ${partTaskId}`);
-  console.log(`[${SERVER_ID}] Результат довжина: ${result?.length || 0}`);
-  console.log(`[${SERVER_ID}] Основний ID: ${mainTaskId}`);
-  
+
   try {
     const mainTask = await Task.findOne({ taskId: mainTaskId, type: 'distributed' });
     
     if (!mainTask) {
-      console.error(`[${SERVER_ID}] ❌ Основна задача ${mainTaskId} не знайдена`);
+      console.error(`[${SERVER_ID}] Основна задача ${mainTaskId} не знайдена`);
       return res.status(404).json({
         success: false,
         message: 'Основна задача не знайдена'
@@ -913,17 +806,17 @@ app.post('/part-completed', async (req, res) => {
         const totalParts = mainTask.distributedParts.length;
         mainTask.progress = Math.floor((completedParts / totalParts) * 100);
         
-        console.log(`[${SERVER_ID}] 📊 Прогрес задачі ${mainTaskId}: ${completedParts}/${totalParts} частин завершено`);
+        console.log(`[${SERVER_ID}] Прогрес задачі ${mainTaskId}: ${completedParts}/${totalParts} частин завершено`);
         
         if (completedParts === totalParts) {
-          console.log(`[${SERVER_ID}] 🎉 Всі частини завершені - об'єднання результатів`);
+          console.log(`[${SERVER_ID}] Всі частини завершені - об'єднання результатів`);
           
           try {
             const result1 = mainTask.distributedParts.find(p => p.partId.endsWith('_part1'))?.result;
             const result2 = mainTask.distributedParts.find(p => p.partId.endsWith('_part2'))?.result;
             
             if (result1 && result2) {
-              console.log(`[${SERVER_ID}] 🔄 Множення результатів...`);
+              console.log(`[${SERVER_ID}] Множення результатів...`);
               const finalResult = BigInt(result1) * BigInt(result2);
               
               mainTask.result = finalResult.toString();
@@ -935,14 +828,14 @@ app.post('/part-completed', async (req, res) => {
                 result: mainTask.result.substring(0, 50) + '...'
               });
               
-              console.log(`[${SERVER_ID}] ✅ Фінальний результат: ${mainTask.result.substring(0, 50)}...`);
+              console.log(`[${SERVER_ID}] Фінальний результат: ${mainTask.result.substring(0, 50)}...`);
             } else {
-              console.error(`[${SERVER_ID}] ❌ Не знайдено результатів частин`);
+              console.error(`[${SERVER_ID}] Не знайдено результатів частин`);
               mainTask.result = 'ERROR: Missing part results';
               mainTask.status = 'failed';
             }
           } catch (mergeErr) {
-            console.error(`[${SERVER_ID}] ❌ Помилка об\'єднання:`, mergeErr);
+            console.error(`[${SERVER_ID}] Помилка об\'єднання:`, mergeErr);
             mainTask.result = 'ERROR: Merge failed';
             mainTask.status = 'failed';
           }
@@ -959,14 +852,14 @@ app.post('/part-completed', async (req, res) => {
       }
     }
     
-    console.error(`[${SERVER_ID}] ❌ Частина ${partTaskId} не знайдена в задачі ${mainTaskId}`);
+    console.error(`[${SERVER_ID}] Частина ${partTaskId} не знайдена в задачі ${mainTaskId}`);
     res.status(404).json({
       success: false,
       message: 'Частина не знайдена в задачі'
     });
     
   } catch (err) {
-    console.error(`[${SERVER_ID}] ❌ Помилка обробки part-completed:`, err);
+    console.error(`[${SERVER_ID}] Помилка обробки part-completed:`, err);
     res.status(500).json({
       success: false,
       error: err.message
@@ -1029,32 +922,89 @@ app.get('/progress', authMiddleware, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 app.post('/cancel', authMiddleware, async (req, res) => {
   const { taskId } = req.body;
   
-  console.log(`[${SERVER_ID}] ❌ Скасування задачі ${taskId} користувачем ${req.username}`);
+  console.log(`[${SERVER_ID}] Спроба скасувати задачу ${taskId} від користувача ${req.userId}`);
   
-  if (runningTasks[taskId]) {
-    try {
-      await runningTasks[taskId].terminate();
-      delete runningTasks[taskId];
-      runningCount = Math.max(0, runningCount - 1);
-    } catch (err) {
-      console.error(`Помилка скасування worker ${taskId}:`, err);
+  let cancelled = false;
+  
+  // Спочатку оновлюємо статус в БД
+  const task = await Task.findOne({ taskId, userId: req.userId });
+  
+  if (task) {
+    if (task.status !== 'cancelled') {
+      task.result = 'CANCELLED';
+      task.progress = 0;
+      task.status = 'cancelled';
+      task.steps.push({
+        server: SERVER_ID,
+        step: 'Скасовано користувачем',
+        result: null,
+        timestamp: Date.now()
+      });
+      
+      await task.save();
+      console.log(`[${SERVER_ID}] Статус задачі ${taskId} оновлено в БД: CANCELLED`);
+      cancelled = true;
+    } else {
+      console.log(`[${SERVER_ID}] Задача ${taskId} вже має статус CANCELLED`);
+      cancelled = true;
     }
   }
   
+  // Потім скасовуємо воркера
+  if (runningTasks[taskId]) {
+    try {
+      console.log(`[${SERVER_ID}] Воркер ${taskId} знайдено, скасую...`);
+      
+      // Відправляємо повідомлення воркеру про скасування
+      if (runningTasks[taskId].postMessage) {
+        runningTasks[taskId].postMessage({ type: 'cancel' });
+        console.log(`[${SERVER_ID}] Повідомлення про скасування відправлено воркеру ${taskId}`);
+        
+        // Даємо воркеру дуже мало часу на завершення
+        setTimeout(async () => {
+          if (runningTasks[taskId]) {
+            console.log(`[${SERVER_ID}] Примусово завершую воркер ${taskId}...`);
+            try {
+              await runningTasks[taskId].terminate();
+              console.log(`[${SERVER_ID}] Воркер ${taskId} примусово завершено`);
+            } catch (terminateErr) {
+              console.error(`[${SERVER_ID}] Помилка примусового завершення воркера ${taskId}:`, terminateErr);
+            }
+            delete runningTasks[taskId];
+            runningCount = Math.max(0, runningCount - 1);
+          }
+        }, 500); // Тільки 500мс на плавне завершення
+      } else {
+        // Якщо postMessage недоступний, термінуємо негайно
+        console.log(`[${SERVER_ID}] Терміную воркер ${taskId} негайно...`);
+        await runningTasks[taskId].terminate();
+        delete runningTasks[taskId];
+        runningCount = Math.max(0, runningCount - 1);
+        console.log(`[${SERVER_ID}] Воркер ${taskId} негайно завершено`);
+      }
+    } catch (err) {
+      console.error(`Помилка скасування worker ${taskId}:`, err);
+    }
+  } else {
+    console.log(`[${SERVER_ID}] Воркер ${taskId} не знайдено у runningTasks`);
+  }
+  
+  // Видалення з черги Redis
   if (redisClient) {
     try {
       const allTasks = await redisClient.lRange(GLOBAL_QUEUE_NAME, 0, -1);
+      console.log(`[${SERVER_ID}] Перевіряю чергу Redis (${allTasks.length} задач)`);
       
       for (let i = 0; i < allTasks.length; i++) {
         const taskInQueue = JSON.parse(allTasks[i]);
         
         if (taskInQueue.taskId === taskId && taskInQueue.userId === req.userId) {
           await redisClient.lRem(GLOBAL_QUEUE_NAME, 1, allTasks[i]);
-          console.log(`[${SERVER_ID}] ✅ Задачу ${taskId} видалено з черги Redis.`);
+          console.log(`[${SERVER_ID}] Задачу ${taskId} видалено з черги Redis.`);
+          cancelled = true;
           break;
         }
       }
@@ -1063,22 +1013,12 @@ app.post('/cancel', authMiddleware, async (req, res) => {
     }
   }
   
-  const task = await Task.findOne({ taskId, userId: req.userId });
-  
-  if (task) {
-    task.result = 'CANCELLED';
-    task.progress = 0;
-    task.status = 'cancelled';
-    task.steps.push({
-      server: SERVER_ID,
-      step: 'Скасовано користувачем',
-      result: null
-    });
-    
-    await task.save();
-  }
-  
-  res.json({ success: true, taskId });
+  res.json({ 
+    success: true, 
+    taskId,
+    cancelled: cancelled,
+    message: cancelled ? 'Задачу скасовано' : 'Задачу не знайдено'
+  });
 });
 
 app.get('/history', authMiddleware, async (req, res) => {
@@ -1111,40 +1051,6 @@ app.get('/status', (req, res) => {
   });
 });
 
-app.get('/queue-status', async (req, res) => {
-  try {
-    let queueLength = 0;
-    let tasks = [];
-    
-    if (redisClient) {
-      queueLength = await redisClient.lLen(GLOBAL_QUEUE_NAME);
-      const allTasks = await redisClient.lRange(GLOBAL_QUEUE_NAME, 0, -1);
-      tasks = allTasks.map(t => JSON.parse(t)).reverse();
-    }
-    
-    res.json({
-      success: true,
-      queueLength,
-      tasks,
-      servers: [{
-        serverId: SERVER_ID,
-        running: runningCount,
-        max: MAX_CONCURRENT_TASKS,
-        availableSlots: MAX_CONCURRENT_TASKS - runningCount,
-        health: 'healthy'
-      }],
-      totalRunning: runningCount,
-      totalCapacity: MAX_CONCURRENT_TASKS
-    });
-  } catch (err) {
-    console.error('Помилка отримання статусу черги:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// -------------------------------------------------------------------
-// ПРОЦЕСИНГ ЧЕРГИ
-// -------------------------------------------------------------------
 async function processQueue() {
   if (!redisClient || isQueueProcessing) {
     return;
@@ -1155,10 +1061,10 @@ async function processQueue() {
   try {
     const availableSlots = MAX_CONCURRENT_TASKS - runningCount;
     
-    console.log(`[${SERVER_ID}] 🔍 processQueue: runningCount=${runningCount}, availableSlots=${availableSlots}`);
+    console.log(`[${SERVER_ID}]  processQueue: runningCount=${runningCount}, availableSlots=${availableSlots}`);
     
     if (availableSlots <= 0) {
-      console.log(`[${SERVER_ID}] ⏹️ Немає вільних слотів`);
+      console.log(`[${SERVER_ID}] Немає вільних слотів`);
       return;
     }
     
@@ -1166,23 +1072,21 @@ async function processQueue() {
       try {
         const queueLength = await redisClient.lLen(GLOBAL_QUEUE_NAME);
         
-        console.log(`[${SERVER_ID}] 📊 Довжина черги: ${queueLength}`);
-        
         if (queueLength === 0) {
-          console.log(`[${SERVER_ID}] 📭 Черга порожня`);
+          console.log(`[${SERVER_ID}] Черга порожня`);
           break;
         }
         
         const taskStr = await redisClient.rPop(GLOBAL_QUEUE_NAME);
         
         if (!taskStr) {
-          console.log(`[${SERVER_ID}] ⚠️ Не вдалося витягнути задачу`);
+          console.log(`[${SERVER_ID}] Не вдалося витягнути задачу`);
           break;
         }
         
         const taskData = JSON.parse(taskStr);
         
-        console.log(`[${SERVER_ID}] 📤 Витягнуто задачу з черги: ${taskData.taskId}`, {
+        console.log(`[${SERVER_ID}] Витягнуто задачу з черги: ${taskData.taskId}`, {
           type: taskData.type,
           userId: taskData.userId
         });
@@ -1222,24 +1126,12 @@ async function processQueue() {
   }
 }
 
-// Запускаємо обробку черги кожні 2 секунди
-console.log(`[${SERVER_ID}] ⏰ Queue processing interval started (every 2000ms)`);
-
 setInterval(() => {
-  console.log(`[${SERVER_ID}] ⏰ Interval tick at ${new Date().toISOString()}`);
   processQueue().catch(err => {
     console.error('Помилка в processQueue interval:', err);
   });
 }, 2000);
 
-// -------------------------------------------------------------------
-// ЗАПУСК СЕРВЕРА
-// -------------------------------------------------------------------
-
 app.listen(SERVER_PORT, '0.0.0.0', () => {
-  console.log(`🚀 Сервер ${SERVER_ID} запущено на порту ${SERVER_PORT}`);
-  console.log(`🔧 Максимум одночасних задач: ${MAX_CONCURRENT_TASKS}`);
-  console.log(`📊 Поріг розподілу: ${DISTRIBUTION_THRESHOLD}`);
-  if (PEER_URL) console.log(`🤝 Peer сервер: ${PEER_URL}`);
-  console.log(`🏠 Base URL: ${BASE_URL}`);
+  console.log(`[${SERVER_ID}] Сервер запущено на порті ${SERVER_PORT}`);
 });

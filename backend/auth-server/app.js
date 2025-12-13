@@ -8,7 +8,6 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-// Підключення до MongoDB
 mongoose.connect(process.env.MONGO_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
@@ -16,7 +15,6 @@ mongoose.connect(process.env.MONGO_URI, {
 .then(() => console.log('Auth MongoDB connected'))
 .catch(err => console.error('MongoDB connection error:', err));
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', service: 'auth-server' });
 });
@@ -25,8 +23,7 @@ app.get('/health', (req, res) => {
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { username, email, password } = req.body;
-    
-    // Валідація
+
     if (!username || !email || !password) {
       return res.status(400).json({ 
         success: false, 
@@ -49,11 +46,10 @@ app.post('/api/auth/register', async (req, res) => {
     if (existingUser) {
       return res.status(400).json({ 
         success: false, 
-        error: 'Користувач з таким email або іменем вже існує' 
+        error: 'Користувач з таким email або юзернеймом вже існує' 
       });
     }
-    
-    // Створення користувача
+
     const user = new User({ 
       username, 
       email: email.toLowerCase(), 
@@ -85,7 +81,6 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// Логін
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -96,8 +91,7 @@ app.post('/api/auth/login', async (req, res) => {
         error: 'Будь ласка, введіть email та пароль' 
       });
     }
-    
-    // Знаходимо користувача
+
     const user = await User.findOne({ 
       email: email.toLowerCase() 
     });
@@ -105,7 +99,7 @@ app.post('/api/auth/login', async (req, res) => {
     if (!user) {
       return res.status(401).json({ 
         success: false, 
-        error: 'Невірний email або пароль' 
+        error: 'Користувача з таким email не знайдено' 
       });
     }
     
@@ -197,7 +191,6 @@ app.post('/api/auth/verify', async (req, res) => {
   }
 });
 
-// Профіль користувача
 app.get('/api/auth/profile', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
@@ -238,6 +231,6 @@ app.get('/api/auth/profile', async (req, res) => {
 
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
-  console.log(`🔐 Auth Server запущено на порту ${PORT}`);
-  console.log(`🔑 JWT секрет: ${process.env.JWT_SECRET ? 'Налаштовано' : 'Не налаштовано!'}`);
+  console.log(`Auth Server запущено на порту ${PORT}`);
+  console.log(`JWT секрет: ${process.env.JWT_SECRET ? 'Налаштовано' : 'Не налаштовано!'}`);
 });

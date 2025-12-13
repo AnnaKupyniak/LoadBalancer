@@ -17,10 +17,7 @@ const HomePage = ({ user, onLogout, api }) => {
 
   useEffect(() => {
     tasksRef.current = tasks
-    console.log(`[Frontend] Завдання оновлено:`, tasks.length, 'задач')
-    tasks.forEach((task, index) => {
-      console.log(`[Frontend] Задача ${index + 1}: ${task.taskId.slice(-8)}, статус: ${task.status}, прогрес: ${task.progress}%`)
-    })
+
   }, [tasks])
 
   useEffect(() => {
@@ -63,8 +60,6 @@ const HomePage = ({ user, onLogout, api }) => {
     
     try {
       const response = await api.post('/solve', { number: n })
-      console.log(`[Frontend] Старт задачі ${n}!, відповідь:`, response.data)
-
       const newTask = {
         taskId: response.data.taskId,
         number: n,
@@ -80,7 +75,7 @@ const HomePage = ({ user, onLogout, api }) => {
         distributedParts: [],
         partProgress: [],
         createdAt: new Date().toISOString(),
-        completedAt: null // поле для часу завершення
+        completedAt: null 
       }
 
       console.log(`[Frontend] Створено нову задачу:`, newTask)
@@ -135,19 +130,12 @@ const HomePage = ({ user, onLogout, api }) => {
 
   const fetchTaskProgress = async task => {
     try {
-      console.log(`[Frontend] Запит прогресу для ${task.taskId.slice(-8)}`)
-      
+
       const res = await api.get('/progress', {
         params: { taskId: task.taskId }
       })
 
       const data = res.data
-      console.log(`[Frontend] Отримано прогрес для ${task.taskId.slice(-8)}:`, {
-        status: data.status,
-        progress: data.progress,
-        type: data.type,
-        resultLength: data.currentResult?.length || 0
-      })
 
       const getFrontendStatus = (backendStatus, backendProgress) => {
         const status = backendStatus?.toLowerCase() || ''
@@ -188,13 +176,11 @@ const HomePage = ({ user, onLogout, api }) => {
         completedAt: task.completedAt || (frontendStatus === 'completed' ? new Date().toISOString() : null)
       }
 
-      console.log(`[Frontend] Оновлено ${task.taskId.slice(-8)}: статус=${frontendStatus}, прогрес=${progress}%`)
       return updatedTask
 
     } catch (err) {
       console.error('Помилка отримання прогресу:', err)
       if (err.response?.status === 404) {
-        console.log(`[Frontend] Задача ${task.taskId.slice(-8)} не знайдена на сервері`)
         return {
           ...task,
           status: 'failed',
@@ -225,8 +211,6 @@ const HomePage = ({ user, onLogout, api }) => {
         console.log(`[Frontend] Немає активних задач для оновлення`)
         return
       }
-
-      console.log(`[Frontend] Оновлюю ${active.length} активних задач`)
 
       try {
         const updated = await Promise.all(active.map(fetchTaskProgress))

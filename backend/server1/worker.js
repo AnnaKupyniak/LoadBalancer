@@ -1,128 +1,191 @@
-// worker.js - РОБОЧА ВЕРСІЯ
 const { parentPort, workerData } = require('worker_threads');
 
-// workerData містить параметри, передані з головного потоку
-const { taskId, start, end, initialValue, serverName, isPart } = workerData;
-
-console.log(`[Worker ${taskId}] 🚀 ЗАПУСК з ${start} до ${end}`);
-
+const { taskId, start, end, initialValue } = workerData;
 let current = BigInt(start);
 const bigEnd = BigInt(end);
 let accumulation = BigInt(initialValue || 1);
 
 const totalSteps = Number(bigEnd - current + 1n);
 let stepsDone = 0;
+let isCancelled = false;
 
-// Асинхронна функція для затримки
+// Додаємо обробник повідомлень про скасування
+if (parentPort) {
+  parentPort.on('message', (message) => {
+    if (message.type === 'cancel') {
+      console.log(`[Worker ${taskId}] Отримано команду скасування, негайно завершую...`);
+      isCancelled = true;
+      
+      // Відправляємо повідомлення про скасування
+      if (parentPort && parentPort.postMessage) {
+        parentPort.postMessage({
+          type: 'cancelled',
+          taskId,
+          message: 'Задачу скасовано користувачем'
+        });
+        console.log(`[Worker ${taskId}] Повідомлення про скасування відправлено`);
+      }
+      
+      // Виходимо негайно
+      process.exit(0);
+    }
+  });
+}
+
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// ФІКСОВАНА ТРИВАЛІСТЬ - 120 секунд
-const FIXED_DURATION_SECONDS = 120;
+const FIXED_DURATION_SECONDS = 10;
 
 async function calculate() {
     const startTime = Date.now();
-    
-    console.log(`[Worker ${taskId}] ⏱️  Початок обчислення на ${FIXED_DURATION_SECONDS} секунд`);
-    
-    // 1. НЕГАЙНО надсилаємо перший прогрес (0%)
-    parentPort.postMessage({
-        type: 'progress',
-        taskId,
-        currentValue: accumulation.toString(),
-        progress: 0,
-        stepInfo: `Початок обчислення ${start}-${end}`
-    });
-    
-    // 2. Затримка 1 секунда для демонстрації
-    await sleep(1000);
-    
-    // 3. Оновлюємо прогрес (10%)
-    parentPort.postMessage({
-        type: 'progress',
-        taskId,
-        currentValue: accumulation.toString(),
-        progress: 10,
-        stepInfo: `Ініціалізація завершена`
-    });
-    
-    // 4. Розраховуємо затримку на кожен крок
-    let delayPerStep = 0;
-    if (totalSteps > 0) {
-        // Залишаємо 2 секунди на швидке обчислення, решта - затримки
-        const computeTime = 2000; // 2 секунди на обчислення
-        const delayTime = (FIXED_DURATION_SECONDS * 1000) - computeTime - 1000; // Мінус вже витрачений час
-        delayPerStep = Math.max(100, delayTime / totalSteps); // Мінімум 100мс
+
+    if (parentPort) {
+        parentPort.postMessage({
+            type: 'progress',
+            taskId,
+            currentValue: accumulation.toString(),
+            progress: 0,
+            stepInfo: `Початок обчислення ${start}-${end}`
+        });
     }
     
-    console.log(`[Worker ${taskId}] 📊 Затримка на крок: ${delayPerStep.toFixed(0)}мс`);
+    await sleep(1000);
+
+    // Перевіряємо чи не скасовано перед продовженням
+    if (isCancelled) {
+        console.log(`[Worker ${taskId}] Обчислення скасовано на етапі ініціалізації`);
+        return;
+    }
+
+    if (parentPort) {
+        parentPort.postMessage({
+            type: 'progress',
+            taskId,
+            currentValue: accumulation.toString(),
+            progress: 10,
+            stepInfo: `Ініціалізація завершена`
+        });
+    }
     
-    // 5. Основний цикл
+    let delayPerStep = 0;
+    if (totalSteps > 0) {
+        const computeTime = 2000;
+        const delayTime = (FIXED_DURATION_SECONDS * 1000) - computeTime - 1000; 
+        delayPerStep = Math.max(100, delayTime / totalSteps);
+    }
+
+    console.log(`[Worker ${taskId}] Затримка на крок: ${delayPerStep.toFixed(0)}мс, всього кроків: ${totalSteps}`);
+
+    // Частіша перевірка на скасування
     while (current <= bigEnd) {
-        // Обчислення
+        // Часта перевірка на скасування
+        if (isCancelled) {
+            console.log(`[Worker ${taskId}] Обчислення перервано через скасування на кроці ${current}`);
+            return;
+        }
+        
         accumulation *= current;
         stepsDone++;
         
-        // Оновлюємо прогрес кожні 25% або на останньому кроці
-        if (stepsDone === 1 || stepsDone % Math.max(1, Math.floor(totalSteps / 4)) === 0 || current === bigEnd) {
+        // Більш часте відправлення прогресу
+        if (stepsDone === 1 || stepsDone % Math.max(1, Math.floor(totalSteps / 10)) === 0 || current === bigEnd) {
             const progress = Math.min(100, 10 + (stepsDone / totalSteps) * 85);
             const elapsedSeconds = (Date.now() - startTime) / 1000;
             
-            console.log(`[Worker ${taskId}] 📤 Відправляю прогрес: ${progress.toFixed(1)}% (крок ${current})`);
-            
-            parentPort.postMessage({
-                type: 'progress',
-                taskId,
-                currentValue: accumulation.toString(),
-                progress: progress,
-                stepInfo: `${current}! (${elapsedSeconds.toFixed(1)}с)`
-            });
+            if (!isCancelled && parentPort) {
+                parentPort.postMessage({
+                    type: 'progress',
+                    taskId,
+                    currentValue: accumulation.toString(),
+                    progress: progress,
+                    stepInfo: `${current}! (${elapsedSeconds.toFixed(1)}с)`
+                });
+            }
         }
         
-        // Затримка для контролю тривалості
-        if (delayPerStep > 0) {
-            await sleep(delayPerStep);
+        // Менша затримка для швидшої реакції на скасування
+        if (delayPerStep > 0 && !isCancelled) {
+            // Розбиваємо затримку на частини для частішої перевірки
+            const chunkSize = 50;
+            for (let i = 0; i < delayPerStep; i += chunkSize) {
+                if (isCancelled) break;
+                await sleep(Math.min(chunkSize, delayPerStep - i));
+            }
         }
         
-        // Даємо event loop "дихати"
-        if (stepsDone % 50 === 0) {
+        // Частіша перевірка event loop
+        if (stepsDone % 10 === 0 && !isCancelled) {
             await new Promise(resolve => setImmediate(resolve));
         }
         
         current++;
     }
-    
-    // 6. Оновлюємо прогрес до 100%
+
+    // Перевіряємо ще раз перед фіналізацією
+    if (isCancelled) {
+        console.log(`[Worker ${taskId}] Задача скасована, не відправляю фінальний результат`);
+        return;
+    }
+
     const totalTime = (Date.now() - startTime) / 1000;
-    
-    console.log(`[Worker ${taskId}] 🎉 ЗАВЕРШЕНО за ${totalTime.toFixed(1)} секунд`);
-    
-    parentPort.postMessage({
-        type: 'progress',
-        taskId,
-        currentValue: accumulation.toString(),
-        progress: 99,
-        stepInfo: `Фіналізація...`
-    });
+
+    if (parentPort) {
+        parentPort.postMessage({
+            type: 'progress',
+            taskId,
+            currentValue: accumulation.toString(),
+            progress: 99,
+            stepInfo: `Фіналізація... (${totalTime.toFixed(1)}с)`
+        });
+    }
     
     await sleep(500);
     
-    parentPort.postMessage({
-        type: 'done',
-        taskId,
-        result: accumulation.toString(),
-        totalTime: totalTime
-    });
+    if (parentPort && !isCancelled) {
+        parentPort.postMessage({
+            type: 'done',
+            taskId,
+            result: accumulation.toString(),
+            totalTime: totalTime
+        });
+    }
 }
 
-// Обробка помилок
+// Обробка непередбачених помилок
+process.on('uncaughtException', (error) => {
+    console.error(`[Worker ${taskId}] Непередбачена помилка:`, error);
+    if (parentPort) {
+        parentPort.postMessage({
+            type: 'error',
+            taskId,
+            error: error.message
+        });
+    }
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error(`[Worker ${taskId}] Необроблений rejection:`, reason);
+    if (parentPort) {
+        parentPort.postMessage({
+            type: 'error',
+            taskId,
+            error: 'Unhandled rejection: ' + reason
+        });
+    }
+});
+
+// Запускаємо обчислення
 calculate().catch(error => {
-    console.error(`[Worker ${taskId}] ❌ ПОМИЛКА:`, error);
+    console.error(`[Worker ${taskId}] ПОМИЛКА:`, error);
     
-    parentPort.postMessage({
-        type: 'error',
-        taskId,
-        error: error.message
-    });
+    if (parentPort) {
+        parentPort.postMessage({
+            type: 'error',
+            taskId,
+            error: error.message
+        });
+    }
 });

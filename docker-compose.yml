@@ -38,6 +38,8 @@ services:
       - factorial-network
     ports:
       - "8001:8001"
+    env_file:
+      - .env 
     environment:
       - NODE_ENV=production
       - PORT=8001
@@ -51,7 +53,6 @@ services:
       - GLOBAL_QUEUE_NAME=factorial:global:queue
       - GLOBAL_QUEUE_NAME=factorial:global:queue
       - AUTH_SERVICE_URL=http://auth:8000
-      - JWT_SECRET=${JWT_SECRET}
     depends_on:
       redis:
         condition: service_healthy
@@ -66,6 +67,8 @@ services:
       - factorial-network
     ports:
       - "8002:8002"
+    env_file:
+      - .env
     environment:
       - NODE_ENV=production
       - PORT=8002
@@ -76,10 +79,8 @@ services:
       - REDIS_URL=redis://redis:6379
       - DISTRIBUTION_THRESHOLD=70
       - MAX_CONCURRENT_TASKS=2
-      - JWT_SECRET=${JWT_SECRET}
       - GLOBAL_QUEUE_NAME=factorial:global:queue
       - AUTH_SERVICE_URL=http://auth:8000
-      - JWT_SECRET=${JWT_SECRET}
     depends_on:
       redis:
         condition: service_healthy
